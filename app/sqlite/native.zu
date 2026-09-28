@@ -1,0 +1,68 @@
+/**
+ * @module native
+ *
+ * The SQLite C library, declared from its own header and bound to the
+ * copy installed on this machine.
+ *
+ * `sqlite3.h` sits beside this file exactly as SQLite ships it, and is
+ * read whole: its macros, its typedefs and every prototype in it. It can
+ * be newer than the installed library, so a function the library does
+ * not export is left out of the binding rather than refused. Everything
+ * this package calls has been in SQLite since 3.14.
+ *
+ * `api` holds the declarations, for types and constants by their C
+ * names. `c` is the library bound to them: every function, and every
+ * constant as a member, such as `c.SQLITE_ROW`.
+ */
+
+import ffi
+import os
+
+var _HEADER = os.join_paths(os.dir_name(__file__), 'sqlite3.h')
+
+var api = ffi.declare(file(_HEADER).read())
+
+var c = api.bind(ffi.open('sqlite3'), { allow_missing: true })
+
+/**
+ * `sqlite3_step()` run on a helper thread. The isolate keeps answering
+ * callbacks while it waits, so a progress handler SQLite calls from
+ * that thread still runs.
+ */
+var threaded_step = ffi.threaded(c.sqlite3_step)
+
+/**
+ * Tells SQLite to take its own copy of the text or blob it is handed,
+ * so the Zuri value needs to live no longer than the call.
+ */
+var TRANSIENT = api.constant('SQLITE_TRANSIENT')
+
+# The shapes of the callbacks this package hands SQLite.
+var SCALAR = api.type('void (*)(sqlite3_context *, int, sqlite3_value **)')
+var FINAL = api.type('void (*)(sqlite3_context *)')
+var COMPARE = api.type('int (*)(void *, int, const void *, int, const void *)')
+var UPDATE_HOOK = api.type(
+  'void (*)(void *, int, const char *, const char *, sqlite3_int64)'
+)
+var PROGRESS = api.type('int (*)(void *)')
+var TRACE = api.type('int (*)(unsigned int, void *, void *, void *)')
+
+/**
+ * The version of the SQLite library in use, such as `'3.46.1'`.
+ *
+ * @returns string
+ */
+def version() {
+  return c.sqlite3_libversion()
+}
+
+/**
+ * Whether the library was compiled with `option`, spelt without its
+ * `SQLITE_` prefix: `has_option('ENABLE_FTS5')`.
+ *
+ * @param string option
+ * @returns bool
+ */
+def has_option(option: string) {
+  return c.sqlite3_compileoption_used(option) == 1
+}

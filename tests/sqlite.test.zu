@@ -1,0 +1,559 @@
+# Tests for the SQLite driver the app builds on ffi.
+
+import test { * }
+import os
+
+import ..app.sqlite
+
+describe('opening', @{
+  it('reports the library version', @{
+    expect(sqlite.version()).to_start_with('3.')
+  })
+
+  it('opens and closes a database, more than once safely', @{
+    var db = sqlite.open(':memory:')
+    expect(db.is_closed()).to_be_false()
+
+    db.close()
+    db.close()
+    expect(db.is_closed()).to_be_true()
+  })
+
+  it('refuses work on a closed database', @{
+    var db = sqlite.open(':memory:')
+    db.close()
+
+    expect(@{
+      db.select('select 1')
+    }).to_raise_instance_of(sqlite.SqliteError)
+  })
+
+  it('reports a file it cannot open', @{
+    var missing = os.join_paths(os.temp_dir(), 'no-such-dir-${time()}', 'x.db')
+
+    expect(@{
+      sqlite.open(missing, { create: false })
+    }).to_raise_instance_of(sqlite.SqliteError)
+  })
+})
+
+describe('values', @{
+  var db = nil
+
+  before_each(@{
+    db = sqlite.open(':memory:')
+    db.script('create table t (v)')
+  })
+
+  after_each(@{
+    db.close()
+  })
+
+  def round_trip(value) {
+    db.execute('delete from t')
+    db.execute('insert into t values (?)', [value])
+
+    return db.value('select v from t')
+  }
+
+  it('round-trips nil, numbers, text and bytes', @{
+    expect(round_trip(nil)).to_be_nil()
+    expect(round_trip(42)).to_be(42)
+    expect(round_trip(-7)).to_be(-7)
+    expect(round_trip(2.5)).to_be(2.5)
+    expect(round_trip('héllo, wörld')).to_be('héllo, wörld')
+    expect(round_trip(bytes([0, 1, 255]))).to_equal(bytes([0, 1, 255]))
+  })
+
+  it('stores a bool as 1 or 0', @{
+    expect(round_trip(true)).to_be(1)
+    expect(round_trip(false)).to_be(0)
+  })
+
+  it('keeps empty text and empty blobs apart from NULL', @{
+    expect(round_trip('')).to_be('')
+    expect(db.value('select typeof(v) from t')).to_be('text')
+
+    expect(round_trip(bytes(0))).to_equal(bytes(0))
+    expect(db.value('select typeof(v) from t')).to_be('blob')
+  })
+
+  it('keeps text holding a NUL whole', @{
+    expect(round_trip('a\x00b')).to_be('a\x00b')
+  })
+
+  it('carries 64-bit integers exactly, as bigints past 2^53', @{
+    var big = 2n ** 62n + 1n
+    expect(round_trip(big)).to_be(big)
+    expect(db.value('select v + 1 from t')).to_be(big + 1n)
+  })
+
+  it('binds parameters by name, with or without their prefix', @{
+    db.execute('insert into t values (:a), (@b), ($c)', { a: 1, '@b': 2, c: 3 })
+
+    var found = db.select('select v from t order by v').map(@(row) => row.v)
+    expect(found).to_equal([1, 2, 3])
+  })
+
+  it('refuses a value SQLite has no counterpart for', @{
+    expect(@{
+      db.execute('insert into t values (?)', [{ a: 1 }])
+    }).to_raise_instance_of(TypeError)
+  })
+
+  it('refuses an unknown parameter name', @{
+    expect(@{
+      db.execute('insert into t values (:a)', { b: 1 })
+    }).to_raise_instance_of(sqlite.SqliteError)
+  })
+})
+
+describe('statements', @{
+  var db = nil
+
+  before_each(@{
+    db = sqlite.open(':memory:')
+    db.script('create table people (name text, born integer)')
+  })
+
+  after_each(@{
+    db.close()
+  })
+
+  it('runs one prepared statement many times', @{
+    var insert = db.prepare('insert into people values (?, ?)')
+    expect(insert.parameter_count()).to_be(2)
+
+    insert.run(['Ada', 1815])
+    var outcome = insert.run(['Grace', 1906])
+    insert.close()
+
+    expect(outcome.rows_affected).to_be(1)
+    expect(outcome.last_insert_id).to_be(2)
+    expect(db.value('select count(*) from people')).to_be(2)
+  })
+
+  it('describes its columns and its bound SQL', @{
+    var select = db.prepare(
+      'select name, born as year from people where born > ?'
+    )
+    select.bind([1900])
+
+    expect(select.columns()).to_equal(['name', 'year'])
+    expect(select.expanded_sql()).to_be(
+      'select name, born as year from people where born > 1900'
+    )
+    select.close()
+  })
+
+  it('visits rows one at a time and stops when asked', @{
+    db.execute(
+      'insert into people values (?, ?), (?, ?), (?, ?)',
+      ['a', 1, 'b', 2, 'c', 3],
+    )
+
+    var seen = []
+    var statement = db.prepare('select name from people order by born')
+    var visited = statement.each(nil, @(row) {
+      seen.append(row.name)
+      return seen.length() < 2
+    })
+    statement.close()
+
+    expect(visited).to_be(2)
+    expect(seen).to_equal(['a', 'b'])
+  })
+
+  it('reports a syntax error with its message and code', @{
+    var error = nil
+    catch {
+      db.select('selec 1')
+    } as e {
+      error = e
+    }
+
+    expect(error).to_be_instance_of(sqlite.SqliteError)
+    expect(error.message).to_contain('syntax error')
+    expect(error.code).to_be(1)
+  })
+
+  it('reports a constraint failure by its extended code', @{
+    db.script('create table unique_names (name text unique)')
+    db.execute('insert into unique_names values (?)', ['x'])
+
+    var error = nil
+    catch {
+      db.execute('insert into unique_names values (?)', ['x'])
+    } as e {
+      error = e
+    }
+
+    expect(error.code).to_be(2067)
+    expect(error.primary()).to_be(19)
+  })
+
+  it('can be used again after it fails', @{
+    db.script('create table checked (n integer check (n > 0))')
+    var insert = db.prepare('insert into checked values (?)')
+
+    expect(@{
+      insert.run([-1])
+    }).to_raise_instance_of(sqlite.SqliteError)
+    insert.run([1])
+    insert.close()
+
+    expect(db.value('select count(*) from checked')).to_be(1)
+  })
+})
+
+describe('scripts', @{
+  it('runs several statements and reports their rows as text', @{
+    var db = sqlite.open(':memory:')
+    var rows = []
+
+    var sql = 'create table t (a, b);
+      insert into t values (1, null), (2, \'x\');
+      select * from t'
+
+    db.script(sql, @(row) {
+      rows.append(row)
+    })
+    db.close()
+
+    expect(rows).to_equal([{ a: '1', b: nil }, { a: '2', b: 'x' }])
+  })
+
+  it('stops when the visitor says so', @{
+    var db = sqlite.open(':memory:')
+    var count = 0
+
+    expect(@{
+      db.script('select 1 union all select 2 union all select 3', @(row) {
+        count++
+        return false
+      })
+    }).to_raise_instance_of(sqlite.SqliteError)
+    db.close()
+
+    expect(count).to_be(1)
+  })
+
+  it('reports the failing statement\'s message', @{
+    var db = sqlite.open(':memory:')
+
+    expect(@{
+      db.script('create table t (a); insert into nowhere values (1)')
+    }).
+      to_raise_with_message('no such table: nowhere')
+    db.close()
+  })
+})
+
+describe('transactions', @{
+  var db = nil
+
+  before_each(@{
+    db = sqlite.open(':memory:')
+    db.script('create table t (n)')
+  })
+
+  after_each(@{
+    db.close()
+  })
+
+  it('commits what the body did', @{
+    var result = db.transaction(@(tx) {
+      tx.execute('insert into t values (1)')
+      expect(tx.in_transaction()).to_be_true()
+      return 'done'
+    })
+
+    expect(result).to_be('done')
+    expect(db.in_transaction()).to_be_false()
+    expect(db.value('select count(*) from t')).to_be(1)
+  })
+
+  it('rolls back when the body raises, and raises again', @{
+    expect(@{
+      db.transaction(@(tx) {
+        tx.execute('insert into t values (1)')
+        raise ValueError('no')
+      })
+    }).to_raise_instance_of(ValueError)
+
+    expect(db.value('select count(*) from t')).to_be(0)
+  })
+
+  it('rolls back an inner transaction alone', @{
+    db.transaction(@(outer) {
+      outer.execute('insert into t values (1)')
+
+      catch {
+        outer.transaction(@(inner) {
+          inner.execute('insert into t values (2)')
+          raise Error('inner')
+        })
+      } as e {
+      }
+
+      outer.execute('insert into t values (3)')
+    })
+
+    var kept = db.select('select n from t order by n').map(@(row) => row.n)
+    expect(kept).to_equal([1, 3])
+  })
+})
+
+describe('functions written in Zuri', @{
+  var db = nil
+
+  before_each(@{
+    db = sqlite.open(':memory:')
+  })
+
+  after_each(@{
+    db.close()
+  })
+
+  it('calls a scalar function with every kind of value', @{
+    db.create_function('describe', 1, @(v) => typeof(v))
+
+    expect(db.value('select describe(1)')).to_be('number')
+    expect(db.value('select describe(1.5)')).to_be('number')
+    expect(db.value('select describe(\'x\')')).to_be('string')
+    expect(db.value('select describe(x\'00ff\')')).to_be('bytes')
+    expect(db.value('select describe(null)')).to_be('nil')
+  })
+
+  it('returns every kind of value', @{
+    db.create_function('pick', 1, @(n) {
+      return [nil, 7, 2.5, 'text', bytes([9]), true][n]
+    })
+
+    expect(db.value('select pick(0)')).to_be_nil()
+    expect(db.value('select pick(1)')).to_be(7)
+    expect(db.value('select pick(2)')).to_be(2.5)
+    expect(db.value('select pick(3)')).to_be('text')
+    expect(db.value('select pick(4)')).to_equal(bytes([9]))
+    expect(db.value('select pick(5)')).to_be(1)
+  })
+
+  it('takes any number of arguments with an arity of -1', @{
+    db.create_function('total', -1, @(...numbers) {
+      var total = 0
+      for n in numbers {
+        total += n
+      }
+
+      return total
+    })
+
+    expect(db.value('select total(1, 2, 3, 4)')).to_be(10)
+  })
+
+  it('fails the statement with the error the function raised', @{
+    db.create_function('boom', 0, @() {
+      raise ValueError('went off')
+    })
+
+    expect(@{
+      db.value('select boom()')
+    }).to_raise_with_message('went off')
+  })
+
+  it('replaces a function registered again', @{
+    db.create_function('answer', 0, @() => 1)
+    db.create_function('answer', 0, @() => 2)
+
+    expect(db.value('select answer()')).to_be(2)
+  })
+
+  it('folds rows into an aggregate, one accumulator per group', @{
+    db.script('create table sales (region text, amount integer);
+      insert into sales values (\'north\', 10), (\'south\', 5), (\'north\', 7)')
+    db.create_aggregate('biggest', 1,
+      @(best, amount) => best == nil ? amount : best.max(amount),
+      @(best) => best
+    )
+
+    var rows = db.select(
+      'select region, biggest(amount) as top from sales
+       group by region order by region'
+    )
+
+    expect(rows).to_equal([
+      { region: 'north', top: 10 }, { region: 'south', top: 5 },
+    ])
+  })
+
+  it('finishes an aggregate over no rows with nil', @{
+    db.script('create table empty (n)')
+    db.create_aggregate(
+      'count_all', 1, @(n, v) => (n or 0) + 1, @(n) => n == nil ? 'none' : n,
+    )
+
+    expect(db.value('select count_all(n) from empty')).to_be('none')
+  })
+
+  it('orders text with a collation', @{
+    db.script('create table words (w text);
+      insert into words values (\'ccc\'), (\'a\'), (\'bb\')')
+    db.create_collation('by_length', @(a, b) => a.length() - b.length())
+
+    var words = db
+      .select('select w from words order by w collate by_length')
+      .map(@(row) => row.w)
+
+    expect(words).to_equal(['a', 'bb', 'ccc'])
+  })
+})
+
+describe('hooks', @{
+  var db = nil
+
+  before_each(@{
+    db = sqlite.open(':memory:')
+    db.script('create table t (n)')
+  })
+
+  after_each(@{
+    db.close()
+  })
+
+  it('reports each changed row, until cleared', @{
+    var changes = []
+    db.on_change(@(operation, table, rowid) {
+      changes.append([operation, table, rowid])
+    })
+
+    db.execute('insert into t values (1)')
+    db.execute('update t set n = 2')
+    db.execute('delete from t where n = 2')
+    db.on_change(nil)
+    db.execute('insert into t values (3)')
+
+    expect(changes).to_equal([
+      ['insert', 't', 1], ['update', 't', 1], ['delete', 't', 1],
+    ])
+  })
+
+  it('interrupts a statement when the progress handler says so', @{
+    db.on_progress(1000, @() => false)
+
+    var error = nil
+    catch {
+      db.value('with recursive n (i) as
+        (select 1 union all select i + 1 from n)
+        select count(*) from n')
+    } as e {
+      error = e
+    }
+
+    expect(error).to_be_instance_of(sqlite.SqliteError)
+    expect(error.primary()).to_be(9)
+  })
+
+  it('traces statements with their parameters filled in', @{
+    var traced = []
+    db.on_trace(@(sql, milliseconds) {
+      traced.append(sql)
+      expect(milliseconds).to_be_greater_than_or_equal(0)
+    })
+
+    db.execute('insert into t values (?)', ['traced'])
+
+    expect(traced).to_equal(['insert into t values (\'traced\')'])
+  })
+})
+
+describe('a threaded connection', @{
+  it('answers the progress handler SQLite calls from its own thread', @{
+    var db = sqlite.open(':memory:', { threaded: true })
+    var calls = 0
+    db.on_progress(10000, @() {
+      calls++
+    })
+
+    var total = db.value(
+      'with recursive n (i) as
+         (select 1 union all select i + 1 from n where i < 100000)
+       select sum(i) from n'
+    )
+    db.close()
+
+    expect(total).to_be(5000050000)
+    expect(calls).to_be_greater_than(0)
+  })
+})
+
+describe('quoting', @{
+  it('quotes text with SQLite\'s own %Q format', @{
+    var db = sqlite.open(':memory:')
+
+    expect(db.quote('it\'s')).to_be('\'it\'\'s\'')
+    expect(db.quote(nil)).to_be('NULL')
+    db.close()
+  })
+})
+
+describe('blobs', @{
+  it('writes and reads a cell a window at a time', @{
+    var db = sqlite.open(':memory:')
+    db.script('create table files (data blob);
+      insert into files values (zeroblob(6))')
+
+    var blob = db.blob('files', 'data', 1, true)
+    expect(blob.length()).to_be(6)
+    blob.write(bytes([1, 2, 3]), 0)
+    blob.write(bytes([4, 5, 6]), 3)
+    expect(blob.read(2, 3)).to_equal(bytes([3, 4, 5]))
+    blob.close()
+
+    var stored = db.value('select data from files')
+    expect(stored).to_equal(bytes([1, 2, 3, 4, 5, 6]))
+    db.close()
+  })
+
+  it('refuses to read past the end, or to write when read-only', @{
+    var db = sqlite.open(':memory:')
+    db.script('create table files (data blob);
+      insert into files values (zeroblob(4))')
+
+    var blob = db.blob('files', 'data', 1)
+    expect(@{
+      blob.read(2, 5)
+    }).to_raise_instance_of(sqlite.SqliteError)
+    expect(@{
+      blob.write(bytes([1]), 0)
+    }).to_raise_instance_of(sqlite.SqliteError)
+    blob.close()
+    db.close()
+  })
+})
+
+describe('backups', @{
+  it('copies a database to a file, reporting progress', @{
+    var folder = os.create_temp_dir('sqlite-backup-')
+    var path = os.join_paths(folder, 'copy.db')
+
+    var db = sqlite.open(':memory:')
+    db.script('create table t (n); insert into t values (1), (2), (3)')
+
+    var reports = []
+    var pages = db.backup_to(path, {
+      pages: 1,
+      progress: @(remaining, total) {
+        reports.append(remaining)
+      },
+    })
+    db.close()
+
+    var copy = sqlite.open(path, { readonly: true })
+    expect(copy.value('select sum(n) from t')).to_be(6)
+    copy.close()
+
+    expect(pages).to_be_greater_than(0)
+    expect(reports.last()).to_be(0)
+    os.remove_dir(folder, true)
+  })
+})

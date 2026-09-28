@@ -1,0 +1,21 @@
+# Zuri's own working directory. Commands the project ships are
+# part of it and stay.
+.zuri/*
+!.zuri/cmds/
+
+# Editors
+.vscode/
+.idea/
+.vs/
+*.swp
+
+# Operating systems
+.DS_Store
+Thumbs.db
+
+# Notebooks the command line creates
+*.db
+
+# Logs and scratch
+*.log
+tmp/

@@ -1,0 +1,498 @@
+/**
+ * @module notes
+ *
+ * A notebook kept in SQLite: notes with tags and attachments, full-text
+ * search ranked by relevance, and statistics computed inside the
+ * database by functions written in Zuri.
+ *
+ * ```zuri,ignore
+ * var book = Notebook(':memory:')
+ * var id = book.add('Groceries', 'milk, eggs and bread', ['home'])
+ *
+ * echo book.search('eggs')
+ * book.close()
+ * ```
+ */
+
+import .sqlite { Database, has_option }
+
+# The time now in Unix seconds, with a fraction, written so any SQLite
+# version computes it.
+var _NOW = '((julianday(\'now\') - 2440587.5) * 86400.0)'
+
+# The tables, the full-text index over them, and the triggers that keep
+# the index in step with the notes.
+var _SCHEMA = '
+  pragma foreign_keys = on;
+
+  create table if not exists notes (
+    id integer primary key,
+    title text not null,
+    body text not null default \'\',
+    created real not null default ${_NOW},
+    updated real not null default ${_NOW}
+  );
+
+  create table if not exists tags (
+    note integer not null references notes (id) on delete cascade,
+    tag text not null collate nocase,
+    primary key (note, tag)
+  ) without rowid;
+
+  create table if not exists attachments (
+    id integer primary key,
+    note integer not null references notes (id) on delete cascade,
+    name text not null,
+    content blob not null,
+    unique (note, name)
+  );
+
+  create virtual table if not exists notes_search using fts5(
+    title, body, content = \'notes\', content_rowid = \'id\',
+    tokenize = \'porter unicode61\'
+  );
+
+  create trigger if not exists notes_added after insert on notes begin
+    insert into notes_search (rowid, title, body)
+      values (new.id, new.title, new.body);
+  end;
+
+  create trigger if not exists notes_removed after delete on notes begin
+    insert into notes_search (notes_search, rowid, title, body)
+      values (\'delete\', old.id, old.title, old.body);
+  end;
+
+  create trigger if not exists notes_changed after update on notes begin
+    insert into notes_search (notes_search, rowid, title, body)
+      values (\'delete\', old.id, old.title, old.body);
+    insert into notes_search (rowid, title, body)
+      values (new.id, new.title, new.body);
+  end;
+'
+
+# Attachments move through a blob handle this many bytes at a time.
+var _CHUNK = 65536
+
+/**
+ * Raised for a note that does not exist, or a request the notebook
+ * cannot carry out.
+ */
+class NotebookError < Error {}
+
+/**
+ * Orders text the way a person reads it: `'note 2'` before `'note 10'`,
+ * letters without regard to case.
+ *
+ * @param string a
+ * @param string b
+ * @returns number Negative, zero or positive.
+ */
+def natural_compare(a: string, b: string) {
+  var left = _runs(a.lower())
+  var right = _runs(b.lower())
+  var shared = left.length().min(right.length())
+
+  iter var i = 0; i < shared; i++ {
+    var x = left[i]
+    var y = right[i]
+
+    if x.is_number() and y.is_number() {
+      var difference = x.to_number() - y.to_number()
+      if difference != 0 {
+        return difference
+      }
+    } else if x != y {
+      return x.compare(y)
+    }
+  }
+
+  return left.length() - right.length()
+}
+
+/**
+ * How many words `text` holds, counting any run of characters between
+ * spaces, tabs and line breaks as one.
+ *
+ * @param string|nil text
+ * @returns number
+ */
+def word_count(text) {
+  if text == nil {
+    return 0
+  }
+
+  var spaced = text.replace('\n', ' ').replace('\t', ' ').replace('\r', ' ')
+
+  return spaced.split(' ').filter(@(word) => !word.is_empty()).length()
+}
+
+# `text` split into runs of digits and runs of everything else.
+def _runs(text: string) {
+  var runs = []
+  var current = ''
+  var digits = false
+
+  iter var i = 0; i < text.length(); i++ {
+    var ch = text[i]
+    var is_digit = ch.is_number()
+
+    if current != '' and is_digit != digits {
+      runs.append(current)
+      current = ''
+    }
+
+    current += ch
+    digits = is_digit
+  }
+
+  if current != '' {
+    runs.append(current)
+  }
+
+  return runs
+}
+
+/**
+ * A notebook stored in one SQLite database.
+ */
+class Notebook {
+  var _db
+
+  /**
+   * Opens the notebook at `path`, creating it when it is missing.
+   *
+   * @param string path A file, or `':memory:'` for one that lasts as
+   *    long as this object.
+   * @param dict|nil options Passed on to the `Database` constructor.
+   * @throws NotebookError when SQLite was built without full-text search.
+   * @constructor
+   */
+  @new(path: string, options) {
+    if !has_option('ENABLE_FTS5') {
+      raise NotebookError(
+        'this SQLite was built without FTS5, which search needs'
+      )
+    }
+
+    self._db = Database(path, options)
+    self._db.script(_SCHEMA)
+
+    self._db.create_function('word_count', 1, word_count)
+    self._db.create_collation('human', natural_compare)
+
+    # The title of the note with the most words in each group.
+    self._db.create_aggregate('wordiest', 2,
+      @(best, title, words) {
+        if best == nil or words > best.words {
+          return { title, words }
+        }
+
+        return best
+      },
+      @(best) => best == nil ? nil : best.title
+    )
+  }
+
+  /**
+   * The database underneath, for anything the notebook does not cover.
+   *
+   * @returns Database
+   */
+  database() {
+    return self._db
+  }
+
+  /**
+   * Writes a new note.
+   *
+   * @param string title
+   * @param string|nil body
+   * @param list|nil tags
+   * @returns number The new note's id.
+   */
+  add(title: string, body, tags) {
+    return self._db.transaction(@(db) {
+      var id = db.execute(
+        'insert into notes (title, body) values (?, ?)',
+        [title, body or '']
+      ).last_insert_id
+
+      for tag in tags or [] {
+        db.execute(
+          'insert or ignore into tags (note, tag) values (?, ?)', [id, tag],
+        )
+      }
+
+      return id
+    })
+  }
+
+  /**
+   * One note with its tags and the names of its attachments, or nil
+   * when there is no such note.
+   *
+   * @param number id
+   * @returns dict|nil `{ id, title, body, tags, attachments, created,
+   *    updated }`
+   */
+  get(id: number) {
+    var note = self._db.first(
+      'select id, title, body,
+        datetime(created, \'unixepoch\') as created,
+        datetime(updated, \'unixepoch\') as updated
+       from notes where id = ?',
+      [id]
+    )
+
+    if note == nil {
+      return nil
+    }
+
+    note['tags'] = self._db.select(
+      'select tag from tags where note = ? order by tag collate human',
+      [id]
+    ).map(@(row) => row.tag)
+
+    note['attachments'] = self._db.select(
+      'select name, length(content) as size from attachments
+       where note = ? order by name collate human',
+      [id]
+    )
+
+    return note
+  }
+
+  /**
+   * Changes a note's title, body, or both.
+   *
+   * @param number id
+   * @param dict changes `title` and `body`, either or both.
+   * @throws NotebookError when there is no such note.
+   */
+  update(id: number, changes: dict) {
+    var outcome = self._db.execute(
+      'update notes set
+        title = coalesce(:title, title),
+        body = coalesce(:body, body),
+        updated = ${_NOW}
+       where id = :id',
+      { id, title: changes.get('title'), body: changes.get('body') }
+    )
+
+    self._require(outcome.rows_affected, id)
+  }
+
+  /**
+   * Deletes a note, with its tags and attachments.
+   *
+   * @param number id
+   * @throws NotebookError when there is no such note.
+   */
+  remove(id: number) {
+    var outcome = self._db.execute('delete from notes where id = ?', [id])
+
+    self._require(outcome.rows_affected, id)
+  }
+
+  /**
+   * Adds tags to a note. Tags are matched without regard to case, and a
+   * tag the note already has is left as it is.
+   *
+   * @param number id
+   * @param list tags
+   * @throws NotebookError when there is no such note.
+   */
+  tag(id: number, tags: list) {
+    self._require(
+      self._db.value('select count(*) from notes where id = ?', [id]), id,
+    )
+
+    self._db.transaction(@(db) {
+      for tag in tags {
+        db.execute(
+          'insert or ignore into tags (note, tag) values (?, ?)', [id, tag],
+        )
+      }
+    })
+  }
+
+  /**
+   * Removes tags from a note.
+   *
+   * @param number id
+   * @param list tags
+   */
+  untag(id: number, tags: list) {
+    self._db.transaction(@(db) {
+      for tag in tags {
+        db.execute('delete from tags where note = ? and tag = ?', [id, tag])
+      }
+    })
+  }
+
+  /**
+   * Every note, or only those carrying `tag`, in natural order of title.
+   *
+   * @param string|nil tag
+   * @returns list `{ id, title, words, tags }` for each note.
+   */
+  list(tag) {
+    var sql = 'select n.id, n.title, word_count(n.body) as words,
+        (select group_concat(tag, \', \') from
+          (select tag from tags where note = n.id
+           order by tag collate human)) as tags
+       from notes n'
+    var params = []
+
+    if tag != nil {
+      sql += ' where exists
+        (select 1 from tags t where t.note = n.id and t.tag = ?)'
+      params.append(tag)
+    }
+
+    return self._db.select(sql + ' order by n.title collate human', params)
+  }
+
+  /**
+   * Notes matching a full-text query, best match first.
+   *
+   * The query is FTS5's own syntax: words, `"quoted phrases"`, `prefix*`,
+   * `AND`, `OR`, `NOT`, and `title:word` for one column. Words match
+   * their other forms, so `run` finds `running`.
+   *
+   * @param string query
+   * @param number|nil limit Defaults to 20.
+   * @returns list `{ id, title, excerpt }`, where `excerpt` marks each
+   *    match with `[` and `]`.
+   * @throws SqliteError when the query is not valid FTS5.
+   */
+  search(query: string, limit) {
+    return self._db.select(
+      'select rowid as id, title,
+        snippet(notes_search, 1, \'[\', \']\', \'...\', 10) as excerpt
+       from notes_search where notes_search match ?
+       order by rank limit ?',
+      [query, limit or 20]
+    )
+  }
+
+  /**
+   * Stores `data` as an attachment called `name` on a note, replacing one
+   * of that name. It is written through a blob handle a window at a time.
+   *
+   * @param number id
+   * @param string name
+   * @param bytes data
+   * @throws NotebookError when there is no such note.
+   */
+  attach(id: number, name: string, data: bytes) {
+    self._require(
+      self._db.value('select count(*) from notes where id = ?', [id]), id,
+    )
+
+    self._db.transaction(@(db) {
+      # The cell is sized first, since a blob handle cannot grow one.
+      db.execute(
+        'insert into attachments (note, name, content)
+         values (?, ?, zeroblob(?))
+         on conflict (note, name) do update set content = excluded.content',
+        [id, name, data.length()]
+      )
+
+      var rowid = db.value(
+        'select id from attachments where note = ? and name = ?', [id, name],
+      )
+      var blob = db.blob('attachments', 'content', rowid, true)
+
+      var at = 0
+      while at < data.length() {
+        var end = (at + _CHUNK).min(data.length())
+        blob.write(data[at, end], at)
+        at = end
+      }
+
+      blob.close()
+    })
+  }
+
+  /**
+   * The contents of an attachment, read through a blob handle a window
+   * at a time.
+   *
+   * @param number id
+   * @param string name
+   * @returns bytes
+   * @throws NotebookError when the note has no attachment of that name.
+   */
+  attachment(id: number, name: string) {
+    var rowid = self._db.value(
+      'select id from attachments where note = ? and name = ?',
+      [id, name]
+    )
+
+    if rowid == nil {
+      raise NotebookError("note ${id} has no attachment called '${name}'")
+    }
+
+    var blob = self._db.blob('attachments', 'content', rowid)
+    var length = blob.length()
+    var data = bytes(0)
+
+    var at = 0
+    while at < length {
+      var size = _CHUNK.min(length - at)
+      data.extend(blob.read(at, size))
+      at += size
+    }
+
+    blob.close()
+
+    return data
+  }
+
+  /**
+   * Totals for the whole notebook.
+   *
+   * @returns dict `{ notes, words, tags, wordiest }`, where `tags` lists
+   *    `{ tag, notes }` with the most used first, and `wordiest` is the
+   *    title of the longest note.
+   */
+  stats() {
+    var totals = self._db.first(
+      'select count(*) as notes, coalesce(sum(word_count(body)), 0) as words,
+        wordiest(title, word_count(body)) as wordiest
+       from notes'
+    )
+
+    totals['tags'] = self._db.select(
+      'select tag, count(*) as notes from tags
+       group by tag order by notes desc, tag collate human'
+    )
+
+    return totals
+  }
+
+  /**
+   * Copies the notebook to a file, while it stays open for use.
+   *
+   * @param string path
+   * @returns number How many database pages were copied.
+   */
+  backup(path: string) {
+    return self._db.backup_to(path)
+  }
+
+  /**
+   * Closes the notebook. Safe to call more than once.
+   */
+  close() {
+    self._db.close()
+  }
+
+  # Raises for a note that was not there to change.
+  _require(found: number, id: number) {
+    if found == 0 {
+      raise NotebookError('there is no note ${id}')
+    }
+  }
+}

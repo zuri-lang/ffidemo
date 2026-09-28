@@ -1,0 +1,19 @@
+/**
+ * ffidemo
+ *
+ * A notebook kept in SQLite, reached through `ffi` and the system's own
+ * libsqlite3: the `sqlite` package drives the C API from its real
+ * header, and `notes` builds a searchable, taggable notebook on it.
+ *
+ * Everything `app` exports is re-exported from here, so this file
+ * is the whole of the project as far as anything importing it is
+ * concerned.
+ */
+
+import @.app { * }
+
+# Running the project starts it. Importing it does not, so another
+# project can build on this one without setting it going.
+if __root__ == __file__ {
+  main()
+}

@@ -1,0 +1,238 @@
+/**
+ * @module values
+ *
+ * Moving values between Zuri and SQLite: binding statement parameters,
+ * reading result columns and function arguments, and setting the
+ * result of a function written in Zuri.
+ *
+ * SQLite stores five kinds of value, and each has one Zuri counterpart:
+ *
+ * | SQLite  | Zuri |
+ * | ------- | ---- |
+ * | NULL    | `nil` |
+ * | INTEGER | a number, or a bigint past 2^53 |
+ * | REAL    | a number |
+ * | TEXT    | a string |
+ * | BLOB    | bytes |
+ *
+ * A bool is stored as the integer 1 or 0, which is how SQLite itself
+ * spells true and false.
+ */
+
+import .native { c, TRANSIENT }
+
+# The largest magnitude a whole number can have and still be stored as
+# a 64-bit integer; anything wider is stored as a real.
+var _INT64_LIMIT = 9223372036854775807
+
+/**
+ * Binds `value` to parameter `index`, counting from 1, of `statement`.
+ *
+ * @param Pointer statement
+ * @param number index
+ * @param any value
+ * @returns number SQLite's result code.
+ * @throws TypeError when the value has no SQLite counterpart.
+ */
+def bind(statement, index: number, value) {
+  if value == nil {
+    return c.sqlite3_bind_null(statement, index)
+  }
+
+  if is_bool(value) {
+    return c.sqlite3_bind_int(statement, index, value ? 1 : 0)
+  }
+
+  if is_bigint(value) {
+    return c.sqlite3_bind_int64(statement, index, value)
+  }
+
+  if is_number(value) {
+    if is_int(value) and value.abs() <= _INT64_LIMIT {
+      return c.sqlite3_bind_int64(statement, index, value)
+    }
+
+    return c.sqlite3_bind_double(statement, index, value)
+  }
+
+  if is_string(value) {
+    # The byte length is passed, so text holding a NUL keeps all of it.
+    var encoded = value.to_bytes()
+    if encoded.length() == 0 {
+      return c.sqlite3_bind_text(statement, index, '', 0, TRANSIENT)
+    }
+
+    return c.sqlite3_bind_text(
+      statement, index, encoded, encoded.length(), TRANSIENT,
+    )
+  }
+
+  if is_bytes(value) {
+    # An empty blob has no storage to point at, and a null pointer would
+    # bind NULL instead.
+    if value.length() == 0 {
+      return c.sqlite3_bind_zeroblob(statement, index, 0)
+    }
+
+    return c.sqlite3_bind_blob(
+      statement, index, value, value.length(), TRANSIENT,
+    )
+  }
+
+  raise TypeError(
+    'SQLite cannot store ${typeof(value)}; ' +
+      'use nil, a bool, a number, a string or bytes'
+  )
+}
+
+/**
+ * The value of column `index`, counting from 0, of the row `statement`
+ * is on.
+ *
+ * @param Pointer statement
+ * @param number index
+ * @returns any
+ */
+def column(statement, index: number) {
+  var kind = c.sqlite3_column_type(statement, index)
+
+  if kind == c.SQLITE_INTEGER {
+    return c.sqlite3_column_int64(statement, index)
+  }
+
+  if kind == c.SQLITE_FLOAT {
+    return c.sqlite3_column_double(statement, index)
+  }
+
+  if kind == c.SQLITE_TEXT {
+    # The text is fetched before its length, as SQLite asks, since
+    # fetching it can convert the value and change the length.
+    var text = c.sqlite3_column_text(statement, index)
+
+    return _text(text, c.sqlite3_column_bytes(statement, index))
+  }
+
+  if kind == c.SQLITE_BLOB {
+    var data = c.sqlite3_column_blob(statement, index)
+
+    return _bytes(data, c.sqlite3_column_bytes(statement, index))
+  }
+
+  return nil
+}
+
+/**
+ * The value a function written in Zuri was called with.
+ *
+ * @param Pointer value A `sqlite3_value *`.
+ * @returns any
+ */
+def argument(value) {
+  var kind = c.sqlite3_value_type(value)
+
+  if kind == c.SQLITE_INTEGER {
+    return c.sqlite3_value_int64(value)
+  }
+
+  if kind == c.SQLITE_FLOAT {
+    return c.sqlite3_value_double(value)
+  }
+
+  if kind == c.SQLITE_TEXT {
+    var text = c.sqlite3_value_text(value)
+
+    return _text(text, c.sqlite3_value_bytes(value))
+  }
+
+  if kind == c.SQLITE_BLOB {
+    var data = c.sqlite3_value_blob(value)
+
+    return _bytes(data, c.sqlite3_value_bytes(value))
+  }
+
+  return nil
+}
+
+/**
+ * Every argument a function was called with, from SQLite's `argc` and
+ * `argv`.
+ *
+ * @param number count
+ * @param Pointer values A `sqlite3_value **`.
+ * @returns list
+ */
+def arguments(count: number, values) {
+  var out = []
+
+  iter var i = 0; i < count; i++ {
+    out.append(argument(values.get(i)))
+  }
+
+  return out
+}
+
+/**
+ * Makes `value` the result of the function call `context` stands for.
+ *
+ * @param Pointer context A `sqlite3_context *`.
+ * @param any value
+ */
+def result(context, value) {
+  if value == nil {
+    c.sqlite3_result_null(context)
+  } else if is_bool(value) {
+    c.sqlite3_result_int(context, value ? 1 : 0)
+  } else if is_bigint(value) {
+    c.sqlite3_result_int64(context, value)
+  } else if is_number(value) {
+    if is_int(value) and value.abs() <= _INT64_LIMIT {
+      c.sqlite3_result_int64(context, value)
+    } else {
+      c.sqlite3_result_double(context, value)
+    }
+  } else if is_string(value) {
+    var encoded = value.to_bytes()
+    if encoded.length() == 0 {
+      c.sqlite3_result_text(context, '', 0, TRANSIENT)
+    } else {
+      c.sqlite3_result_text(context, encoded, encoded.length(), TRANSIENT)
+    }
+  } else if is_bytes(value) {
+    if value.length() == 0 {
+      c.sqlite3_result_zeroblob(context, 0)
+    } else {
+      c.sqlite3_result_blob(context, value, value.length(), TRANSIENT)
+    }
+  } else {
+    error(context, 'a function cannot return ${typeof(value)} to SQLite')
+  }
+}
+
+/**
+ * Fails the function call `context` stands for, so the statement that
+ * made it fails with `message`.
+ *
+ * @param Pointer context
+ * @param string message
+ */
+def error(context, message: string) {
+  c.sqlite3_result_error(context, message, -1)
+}
+
+# Text SQLite owns, `length` bytes of it.
+def _text(pointer, length: number) {
+  if pointer == nil or length == 0 {
+    return ''
+  }
+
+  return pointer.read_string(length)
+}
+
+# A blob SQLite owns, `length` bytes of it.
+def _bytes(pointer, length: number) {
+  if pointer == nil or length == 0 {
+    return bytes(0)
+  }
+
+  return pointer.read_bytes(length)
+}

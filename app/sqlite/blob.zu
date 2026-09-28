@@ -1,0 +1,139 @@
+/**
+ * @module blob
+ *
+ * Reading and writing one blob-valued cell a window at a time, so a
+ * large value never has to be in memory all at once.
+ *
+ * The cell has to exist and already be the size it will end up; a blob
+ * handle cannot grow a value. Insert `zeroblob(n)` for the final size,
+ * then write into it.
+ */
+
+import ffi
+
+import .native { c }
+import .errors { SqliteError, check }
+
+/**
+ * An open handle on one blob.
+ */
+class Blob {
+  var _handle
+  var _db
+  var _writable = false
+
+  /**
+   * Blobs come from `Database.blob()`.
+   *
+   * @param Pointer handle The `sqlite3_blob *`, owned by this blob.
+   * @param Pointer db The connection it was opened on.
+   * @param bool writable
+   * @constructor
+   */
+  @new(handle, db, writable) {
+    self._handle = handle
+    self._db = db
+    self._writable = writable
+  }
+
+  /**
+   * How many bytes the blob holds.
+   *
+   * @returns number
+   */
+  length() {
+    self._open()
+
+    return c.sqlite3_blob_bytes(self._handle)
+  }
+
+  /**
+   * Whether the blob was opened for writing.
+   *
+   * @returns bool
+   */
+  is_writable() {
+    return self._writable
+  }
+
+  /**
+   * Reads `length` bytes starting at `offset`.
+   *
+   * @param number offset
+   * @param number length
+   * @returns bytes
+   * @throws SqliteError when the window runs past the end of the blob.
+   */
+  read(offset: number, length: number) {
+    self._open()
+
+    if length == 0 {
+      return bytes(0)
+    }
+
+    var buffer = ffi.alloc_bytes(length)
+    check(self._db, c.sqlite3_blob_read(self._handle, buffer, length, offset))
+
+    return buffer.read_bytes(length)
+  }
+
+  /**
+   * Reads the whole blob.
+   *
+   * @returns bytes
+   */
+  read_all() {
+    return self.read(0, self.length())
+  }
+
+  /**
+   * Writes `data` starting at `offset`.
+   *
+   * @param bytes data
+   * @param number|nil offset Defaults to 0.
+   * @throws SqliteError when the blob is read-only or `data` runs past
+   *    its end.
+   */
+  write(data: bytes, offset) {
+    self._open()
+
+    if data.length() == 0 {
+      return
+    }
+
+    check(
+      self._db,
+      c.sqlite3_blob_write(self._handle, data, data.length(), offset or 0),
+    )
+  }
+
+  /**
+   * Closes the handle. Safe to call more than once.
+   */
+  close() {
+    if !self._handle.is_freed() {
+      self._handle.free()
+    }
+  }
+
+  /**
+   * Whether `close()` has been called.
+   *
+   * @returns bool
+   */
+  is_closed() {
+    return self._handle.is_freed()
+  }
+
+  to_string() {
+    return self.is_closed()
+      ? '<Blob closed>'
+      : '<Blob of ${self.length()} bytes>'
+  }
+
+  _open() {
+    if self._handle.is_freed() {
+      raise SqliteError('the blob has been closed', c.SQLITE_MISUSE)
+    }
+  }
+}

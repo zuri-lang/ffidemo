@@ -1,0 +1,8 @@
+[project]
+name = "ffidemo"
+version = "0.1.0"
+description = "A notebook kept in SQLite, reached through the ffi module and the system's own libsqlite3."
+authors = ["Richard Ore <eqliqandfriends@gmail.com>"]
+license = "MIT"
+
+[dependencies]

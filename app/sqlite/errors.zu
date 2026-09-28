@@ -1,0 +1,76 @@
+/**
+ * @module errors
+ *
+ * The error every failure inside SQLite is reported as.
+ */
+
+import .native { c }
+
+/**
+ * A result code other than success from SQLite, with the message SQLite
+ * gave for it.
+ */
+class SqliteError < Error {
+  /**
+   * The extended result code, such as `2067` for a unique constraint.
+   *
+   * @type number
+   */
+  var code = 0
+
+  /**
+   * @param string message
+   * @param number|nil code
+   * @constructor
+   */
+  @new(message, code) {
+    parent(message)
+
+    self.code = code or 0
+  }
+
+  /**
+   * The primary result code, the low byte of `code`: `19` for every kind
+   * of constraint failure, `5` for a busy database.
+   *
+   * @returns number
+   */
+  primary() {
+    return self.code & 255
+  }
+
+  to_string() {
+    return '<SqliteError ${self.code}: ${self.message}>'
+  }
+}
+
+/**
+ * Raises the error `db` last reported when `rc` is anything but success,
+ * a row, or the end of a statement.
+ *
+ * @param Pointer|nil db The connection, or nil when there is none yet.
+ * @param number rc
+ * @throws SqliteError
+ */
+def check(db, rc: number) {
+  if rc == c.SQLITE_OK or rc == c.SQLITE_ROW or rc == c.SQLITE_DONE {
+    return
+  }
+
+  raise failure(db, rc)
+}
+
+/**
+ * The error for `rc` on `db`, without raising it.
+ *
+ * @param Pointer|nil db
+ * @param number rc
+ * @returns SqliteError
+ */
+def failure(db, rc: number) {
+  if db == nil {
+    return SqliteError(c.sqlite3_errstr(rc), rc)
+  }
+
+  return SqliteError(c.sqlite3_errmsg(db), c.sqlite3_extended_errcode(db))
+}

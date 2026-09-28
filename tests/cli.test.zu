@@ -1,0 +1,76 @@
+# Tests for the command line, run against a notebook in a temporary file.
+
+import test { * }
+import os
+
+import ..app { parser, run }
+
+describe('the command line', @{
+  var folder = nil
+  var db = nil
+
+  before_each(@{
+    folder = os.create_temp_dir('notes-cli-')
+    db = os.join_paths(folder, 'notes.db')
+  })
+
+  after_each(@{
+    os.remove_dir(folder, true)
+  })
+
+  def notes(...words) {
+    var line = ['--db', db]
+    line.extend(words)
+
+    return run(parser().parse(line))
+  }
+
+  it('adds, lists and shows notes', @{
+    expect(@{
+      notes('add', 'Trip', '--body', 'pack boots', '-t', 'travel')
+    }).
+      to_print('added note 1\n')
+
+    expect(@{
+      notes('list')
+    }).to_print('1. Trip (2 words) [travel]\n')
+
+    var shown = capture_output(@{
+      notes('show', '1')
+    }).lines()
+    expect(shown[0]).to_be('1. Trip')
+    expect(shown[1]).to_start_with('created ')
+    expect(shown[2]).to_be('tags: travel')
+    expect(shown[4]).to_be('pack boots')
+  })
+
+  it('searches', @{
+    notes('add', 'Trip', '--body', 'pack boots')
+
+    expect(@{
+      notes('search', 'boots')
+    }).to_print('1. Trip: pack [boots]\n')
+  })
+
+  it('attaches a file and saves it back', @{
+    var source = os.join_paths(folder, 'hello.txt')
+    file(source, 'w').write('hello')
+    notes('add', 'Files')
+
+    expect(@{
+      notes('attach', '1', '--file', source)
+    }).to_print('attached hello.txt to note 1\n')
+
+    var target = os.join_paths(folder, 'out.txt')
+    notes('save', '1', '--name', 'hello.txt', '--output', target)
+    expect(file(target).read()).to_be('hello')
+  })
+
+  it('fails with status 1 for a note that is not there', @{
+    expect(notes('remove', '7')).to_be(1)
+  })
+
+  it('succeeds with status 0', @{
+    expect(notes('add', 'Fine')).to_be(0)
+  })
+})

@@ -1,0 +1,739 @@
+/**
+ * @module database
+ *
+ * A connection to one SQLite database.
+ */
+
+import ffi
+
+import .native {
+  api,
+  c,
+  SCALAR,
+  FINAL,
+  COMPARE,
+  UPDATE_HOOK,
+  PROGRESS,
+  TRACE,
+}
+import .errors { SqliteError, check, failure }
+import .statement { Statement }
+import .blob { Blob }
+import .values
+
+# What SQLite's update hook reports each kind of change as.
+var _OPERATIONS = {
+  '${c.SQLITE_INSERT}': 'insert',
+  '${c.SQLITE_UPDATE}': 'update',
+  '${c.SQLITE_DELETE}': 'delete',
+}
+
+/**
+ * An open connection.
+ *
+ * Everything the connection registers with SQLite, functions, hooks and
+ * collations written in Zuri, lives as long as the connection and is
+ * released by `close()`.
+ */
+class Database {
+  var _handle
+  var _path
+  var _threaded = false
+  var _callbacks = {}
+  var _groups = {}
+  var _next_group = 0
+  var _depth = 0
+
+  /**
+   * Opens the database at `path`, creating it unless told otherwise.
+   * `':memory:'` is a private database that lives as long as the
+   * connection.
+   *
+   * @param string path
+   * @param dict|nil options
+   *    - `readonly`: open for reading only. Defaults to `false`.
+   *    - `create`: create the file when it is missing. Defaults to
+   *      `true`, and ignored for a read-only connection.
+   *    - `timeout`: how many milliseconds to wait on a database another
+   *      connection has locked. Defaults to 5000.
+   *    - `threaded`: run each step on a helper thread, so a progress
+   *      handler or any other callback SQLite makes while a statement
+   *      runs is answered as it happens. Defaults to `false`.
+   * @throws SqliteError when the database cannot be opened.
+   * @constructor
+   */
+  @new(path: string, options) {
+    var settings = options or {}
+    var readonly = settings.get('readonly', false)
+
+    var flags = c.SQLITE_OPEN_URI
+    if readonly {
+      flags = flags | c.SQLITE_OPEN_READONLY
+    } else {
+      flags = flags | c.SQLITE_OPEN_READWRITE
+      if settings.get('create', true) {
+        flags = flags | c.SQLITE_OPEN_CREATE
+      }
+    }
+
+    # sqlite3_open_v2() hands the connection back through a pointer to a
+    # pointer, and hands one back even when opening fails, so the
+    # message can be read from it.
+    var slot = ffi.alloc(api.type('sqlite3 *'))
+    var rc = c.sqlite3_open_v2(path, slot, flags, nil)
+    var handle = slot.get()
+
+    if rc != c.SQLITE_OK {
+      var error = failure(handle, rc)
+      c.sqlite3_close_v2(handle)
+      raise error
+    }
+
+    self._handle = handle.own(c.sqlite3_close_v2)
+    self._path = path
+    self._threaded = settings.get('threaded', false)
+
+    c.sqlite3_extended_result_codes(handle, 1)
+    c.sqlite3_busy_timeout(handle, settings.get('timeout', 5000))
+  }
+
+  /**
+   * The path the database was opened with.
+   *
+   * @returns string
+   */
+  path() {
+    return self._path
+  }
+
+  /**
+   * The `sqlite3 *` itself, for calling the C API directly.
+   *
+   * @returns Pointer
+   */
+  handle() {
+    self._open()
+
+    return self._handle
+  }
+
+  /**
+   * Compiles one statement.
+   *
+   * @param string sql
+   * @returns Statement
+   * @throws SqliteError when the SQL does not compile.
+   */
+  prepare(sql: string) {
+    self._open()
+
+    var slot = ffi.alloc(api.type('sqlite3_stmt *'))
+    check(self._handle, c.sqlite3_prepare_v2(self._handle, sql, -1, slot, nil))
+
+    var handle = slot.get()
+    if handle == nil {
+      raise SqliteError(
+        'there is no statement in the SQL given', c.SQLITE_MISUSE,
+      )
+    }
+
+    return Statement(
+      handle.own(c.sqlite3_finalize), self._handle, self._threaded,
+    )
+  }
+
+  /**
+   * Runs one statement for its effect.
+   *
+   * @param string sql
+   * @param list|dict|nil params
+   * @returns dict `{ rows_affected, last_insert_id }`
+   */
+  execute(sql: string, params) {
+    var statement = self.prepare(sql)
+
+    catch {
+      var outcome = statement.run(params)
+      statement.close()
+      return outcome
+    } as error {
+      statement.close()
+      raise error
+    }
+  }
+
+  /**
+   * Runs one statement and collects its rows.
+   *
+   * @param string sql
+   * @param list|dict|nil params
+   * @returns list Dictionaries keyed by column name.
+   */
+  select(sql: string, params) {
+    var statement = self.prepare(sql)
+
+    catch {
+      var rows = statement.all(params)
+      statement.close()
+      return rows
+    } as error {
+      statement.close()
+      raise error
+    }
+  }
+
+  /**
+   * The first row a statement produces, or nil when it produces none.
+   *
+   * @param string sql
+   * @param list|dict|nil params
+   * @returns dict|nil
+   */
+  first(sql: string, params) {
+    var statement = self.prepare(sql)
+
+    catch {
+      var row = statement.bind(params).step() ? statement.row() : nil
+      statement.close()
+      return row
+    } as error {
+      statement.close()
+      raise error
+    }
+  }
+
+  /**
+   * The first column of the first row, or nil when there are no rows.
+   *
+   * @param string sql
+   * @param list|dict|nil params
+   * @returns any
+   */
+  value(sql: string, params) {
+    var statement = self.prepare(sql)
+
+    catch {
+      var found = statement.bind(params).step() ? statement.values()[0] : nil
+      statement.close()
+      return found
+    } as error {
+      statement.close()
+      raise error
+    }
+  }
+
+  /**
+   * Runs any number of statements, separated by semicolons, with
+   * `sqlite3_exec()`. Suited to a schema; it takes no parameters.
+   *
+   * With `visit`, each row any of them produces is passed to it as a
+   * dictionary of text, the way `sqlite3_exec()` reports rows, and
+   * `visit` returning `false` stops the run.
+   *
+   * @param string sql
+   * @param function|nil visit
+   * @throws SqliteError when a statement fails or `visit` stops the run.
+   */
+  script(sql: string, visit) {
+    self._open()
+
+    var row = nil
+    if visit != nil {
+      # A Zuri function passed where C wants a function pointer is one
+      # for the length of the call, which is all sqlite3_exec() needs.
+      row = @(data, count, texts, names) {
+        var fields = {}
+
+        iter var i = 0; i < count; i++ {
+          var text = texts.get(i)
+          fields[names.get(i).read_string()] = text == nil
+            ? nil
+            : text.read_string()
+        }
+
+        return visit(fields) == false ? 1 : 0
+      }
+    }
+
+    # The message comes back through a `char **` for the caller to free.
+    var message = ffi.alloc(api.type('char *'))
+    var rc = c.sqlite3_exec(self._handle, sql, row, nil, message)
+
+    if rc != c.SQLITE_OK {
+      var text = message.get()
+      var error = failure(self._handle, rc)
+      if text != nil {
+        error = SqliteError(
+          text.read_string(), c.sqlite3_extended_errcode(self._handle),
+        )
+        c.sqlite3_free(text)
+      }
+
+      raise error
+    }
+  }
+
+  /**
+   * Runs `body` inside a transaction, committing when it returns and
+   * rolling back when it raises. Transactions nest: an inner one is a
+   * savepoint, and rolling it back leaves the outer one going.
+   *
+   * @param function body Called with the database.
+   * @returns any What `body` returned.
+   */
+  transaction(body: function) {
+    self._open()
+
+    var savepoint = 'zuri_${self._depth}'
+    var outer = self._depth == 0
+
+    self.script(outer ? 'begin immediate' : 'savepoint ${savepoint}')
+    self._depth++
+
+    var result = nil
+    catch {
+      result = body(self)
+    } as error {
+      self._depth--
+      self.script(
+        outer ? 'rollback' : 'rollback to ${savepoint}; release ${savepoint}'
+      )
+      raise error
+    }
+
+    self._depth--
+    self.script(outer ? 'commit' : 'release ${savepoint}')
+
+    return result
+  }
+
+  /**
+   * Whether a transaction is open.
+   *
+   * @returns bool
+   */
+  in_transaction() {
+    self._open()
+
+    return c.sqlite3_get_autocommit(self._handle) == 0
+  }
+
+  /**
+   * How many rows the last INSERT, UPDATE or DELETE changed.
+   *
+   * @returns number
+   */
+  changes() {
+    self._open()
+
+    return c.sqlite3_changes(self._handle)
+  }
+
+  /**
+   * The rowid of the last row inserted.
+   *
+   * @returns number
+   */
+  last_insert_id() {
+    self._open()
+
+    return c.sqlite3_last_insert_rowid(self._handle)
+  }
+
+  /**
+   * `text` as an SQL string literal, quoted and escaped by SQLite's own
+   * `%Q` format. Nil is the literal `NULL`.
+   *
+   * @param string|nil text
+   * @returns string
+   */
+  quote(text) {
+    var quoted = c.sqlite3_mprintf('%Q', text).own(c.sqlite3_free)
+    var literal = quoted.read_string()
+    quoted.free()
+
+    return literal
+  }
+
+  /**
+   * Adds an SQL function written in Zuri.
+   *
+   * `body` is called with the SQL arguments as Zuri values, and what it
+   * returns is the function's result. An error it raises fails the
+   * statement that called it, with the error's message.
+   *
+   * ```zuri,ignore
+   * db.create_function('initials', 1, @(name) {
+   *   return ''.join(name.split(' ').map(@(part) => part[0, 1]))
+   * })
+   * ```
+   *
+   * @param string name
+   * @param number arity How many arguments, or -1 for any number.
+   * @param function body
+   * @param dict|nil options `deterministic`: the result depends only on
+   *    the arguments, which lets SQLite use the function in an index.
+   *    Defaults to `true`.
+   */
+  create_function(name: string, arity: number, body: function, options) {
+    self._open()
+
+    var settings = options or {}
+    var flags = c.SQLITE_UTF8
+    if settings.get('deterministic', true) {
+      flags = flags | c.SQLITE_DETERMINISTIC
+    }
+
+    var call = ffi.callback(@(context, count, argv) {
+      catch {
+        values.result(context, body.apply(values.arguments(count, argv)))
+      } as error {
+        values.error(context, error.message)
+      }
+    }, SCALAR)
+
+    var rc = c.sqlite3_create_function_v2(
+      self._handle, name, arity, flags, nil, call, nil, nil, nil
+    )
+
+    self._keep('function ${name}/${arity}', [call], rc)
+  }
+
+  /**
+   * Adds an aggregate function, written as a fold.
+   *
+   * `step` is called once per row with the accumulator so far followed by
+   * the row's arguments, and returns the next accumulator. `finish` is
+   * called once per group with the last accumulator and returns the
+   * group's value. The accumulator starts as nil, which is also what
+   * `finish` sees for a group with no rows.
+   *
+   * @param string name
+   * @param number arity
+   * @param function step
+   * @param function finish
+   */
+  create_aggregate(
+    name: string, arity: number, step: function, finish: function,
+  ) {
+    self._open()
+
+    # SQLite keeps a few bytes per group, zeroed when the group starts;
+    # they hold the number this connection files the group's Zuri
+    # accumulator under.
+    var step_call = ffi.callback(@(context, count, argv) {
+      var slot = c.sqlite3_aggregate_context(context, 8)
+      if slot == nil {
+        c.sqlite3_result_error_nomem(context)
+        return
+      }
+
+      var group = slot.read(ffi.int64)
+      if group == 0 {
+        self._next_group++
+        group = self._next_group
+        slot.write(ffi.int64, group)
+      }
+
+      catch {
+        var params = [self._groups.get(group)]
+        params.extend(values.arguments(count, argv))
+        self._groups[group] = step.apply(params)
+      } as error {
+        values.error(context, error.message)
+      }
+    }, SCALAR)
+
+    var finish_call = ffi.callback(@(context) {
+      var accumulator = nil
+
+      # Asking for no bytes reads the group's slot without creating one,
+      # so a group with no rows has none.
+      var slot = c.sqlite3_aggregate_context(context, 0)
+      if slot != nil {
+        var group = slot.read(ffi.int64)
+        accumulator = self._groups.get(group)
+        self._groups.remove(group)
+      }
+
+      catch {
+        values.result(context, finish(accumulator))
+      } as error {
+        values.error(context, error.message)
+      }
+    }, FINAL)
+
+    var rc = c.sqlite3_create_function_v2(
+      self._handle, name, arity, c.SQLITE_UTF8, nil,
+      nil, step_call, finish_call, nil
+    )
+
+    self._keep('function ${name}/${arity}', [step_call, finish_call], rc)
+  }
+
+  /**
+   * Adds a collation, an ordering for text that a statement asks for
+   * with `collate name`.
+   *
+   * `compare` is passed two strings and returns a negative number, zero
+   * or a positive number, as a sort comparator does. An error it raises
+   * is raised again from the statement once SQLite returns.
+   *
+   * @param string name
+   * @param function compare
+   */
+  create_collation(name: string, compare: function) {
+    self._open()
+
+    # SQLite passes each string as a length and a pointer to that many
+    # bytes, with no terminator.
+    var call = ffi.callback(@(data, left_length, left, right_length, right) {
+      var a = left_length == 0 ? '' : left.read_string(left_length)
+      var b = right_length == 0 ? '' : right.read_string(right_length)
+
+      return compare(a, b).sign()
+    }, COMPARE)
+
+    var rc = c.sqlite3_create_collation_v2(
+      self._handle, name, c.SQLITE_UTF8, nil, call, nil,
+    )
+
+    self._keep('collation ${name}', [call], rc)
+  }
+
+  /**
+   * Called after each row an INSERT, UPDATE or DELETE changes, with the
+   * operation (`'insert'`, `'update'` or `'delete'`), the table, and the
+   * rowid. Nil clears it.
+   *
+   * Rows a trigger or a foreign key action changes are reported too.
+   * Each change is reported as it is made, so one a transaction later
+   * rolls back has still been reported. A DELETE with no WHERE clause
+   * empties the table without visiting its rows, and a WITHOUT ROWID
+   * table has no rowid to report, so neither is reported at all.
+   *
+   * @param function|nil handler
+   */
+  on_change(handler) {
+    self._open()
+
+    if handler == nil {
+      c.sqlite3_update_hook(self._handle, nil, nil)
+      self._keep('on_change', [], c.SQLITE_OK)
+      return
+    }
+
+    var call = ffi.callback(@(data, operation, database, table, rowid) {
+      handler(_OPERATIONS['${operation}'], table.read_string(), rowid)
+    }, UPDATE_HOOK)
+
+    c.sqlite3_update_hook(self._handle, call, nil)
+    self._keep('on_change', [call], c.SQLITE_OK)
+  }
+
+  /**
+   * Called every `instructions` virtual machine steps of a long
+   * statement. `handler` returning `false` interrupts the statement,
+   * which then fails with an interrupted `SqliteError`. Nil clears it.
+   *
+   * @param number instructions
+   * @param function|nil handler
+   */
+  on_progress(instructions: number, handler) {
+    self._open()
+
+    if handler == nil {
+      c.sqlite3_progress_handler(self._handle, 0, nil, nil)
+      self._keep('on_progress', [], c.SQLITE_OK)
+      return
+    }
+
+    var call = ffi.callback(@(data) {
+      return handler() == false ? 1 : 0
+    }, PROGRESS)
+
+    c.sqlite3_progress_handler(self._handle, instructions, call, nil)
+    self._keep('on_progress', [call], c.SQLITE_OK)
+  }
+
+  /**
+   * Called as each statement finishes, with the SQL it ran, parameters
+   * filled in, and how long it took in milliseconds. Nil clears it.
+   *
+   * @param function|nil handler
+   */
+  on_trace(handler) {
+    self._open()
+
+    if handler == nil {
+      c.sqlite3_trace_v2(self._handle, 0, nil, nil)
+      self._keep('on_trace', [], c.SQLITE_OK)
+      return
+    }
+
+    # For a profile event SQLite passes the statement, and a pointer to
+    # the time it took in nanoseconds.
+    var call = ffi.callback(@(event, context, statement, elapsed) {
+      var expanded = c.sqlite3_expanded_sql(statement)
+      if expanded == nil {
+        return 0
+      }
+
+      var sql = expanded.own(c.sqlite3_free).read_string()
+      expanded.free()
+      handler(sql, elapsed.read(ffi.int64) / 1000000)
+
+      return 0
+    }, TRACE)
+
+    c.sqlite3_trace_v2(self._handle, c.SQLITE_TRACE_PROFILE, call, nil)
+    self._keep('on_trace', [call], c.SQLITE_OK)
+  }
+
+  /**
+   * Stops whatever statement is running on this connection at its next
+   * opportunity. Safe to call from a callback.
+   */
+  interrupt() {
+    self._open()
+    c.sqlite3_interrupt(self._handle)
+  }
+
+  /**
+   * Opens one blob for reading or writing a window at a time.
+   *
+   * @param string table
+   * @param string column
+   * @param number rowid
+   * @param bool|nil writable Defaults to `false`.
+   * @returns Blob
+   * @throws SqliteError when the cell does not exist or is not a blob.
+   */
+  blob(table: string, column: string, rowid: number, writable) {
+    self._open()
+
+    var slot = ffi.alloc(api.type('sqlite3_blob *'))
+    var rc = c.sqlite3_blob_open(
+      self._handle, 'main', table, column, rowid, writable ? 1 : 0, slot
+    )
+    check(self._handle, rc)
+
+    return Blob(
+      slot.get().own(c.sqlite3_blob_close), self._handle, writable == true,
+    )
+  }
+
+  /**
+   * Copies the whole database to a file at `path`, replacing what was
+   * there, while this connection stays usable.
+   *
+   * @param string path
+   * @param dict|nil options `pages`: how many pages to copy per step,
+   *    or -1 for all at once, the default. `progress`: called after
+   *    each step with the pages remaining and the total.
+   * @returns number How many pages were copied.
+   */
+  backup_to(path: string, options) {
+    self._open()
+
+    var settings = options or {}
+    var pages = settings.get('pages', -1)
+    var progress = settings.get('progress')
+
+    var target = Database(path)
+
+    catch {
+      var backup = c.sqlite3_backup_init(
+        target.handle(), 'main', self._handle, 'main',
+      )
+      if backup == nil {
+        raise failure(target.handle(), c.sqlite3_errcode(target.handle()))
+      }
+
+      var rc = c.SQLITE_OK
+      while rc == c.SQLITE_OK or rc == c.SQLITE_BUSY or rc == c.SQLITE_LOCKED {
+        rc = c.sqlite3_backup_step(backup, pages)
+
+        if progress != nil {
+          progress(
+            c.sqlite3_backup_remaining(backup),
+            c.sqlite3_backup_pagecount(backup),
+          )
+        }
+      }
+
+      var total = c.sqlite3_backup_pagecount(backup)
+      c.sqlite3_backup_finish(backup)
+
+      if rc != c.SQLITE_DONE {
+        raise failure(target.handle(), rc)
+      }
+
+      target.close()
+
+      return total
+    } as error {
+      target.close()
+      raise error
+    }
+  }
+
+  /**
+   * Closes the connection and releases every callback it registered.
+   * Statements still open keep SQLite's side of it alive until they are
+   * closed too. Safe to call more than once.
+   */
+  close() {
+    if self._handle.is_freed() {
+      return
+    }
+
+    self._handle.free()
+
+    for key, calls in self._callbacks {
+      for call in calls {
+        call.release()
+      }
+    }
+
+    self._callbacks = {}
+    self._groups = {}
+  }
+
+  /**
+   * Whether `close()` has been called.
+   *
+   * @returns bool
+   */
+  is_closed() {
+    return self._handle.is_freed()
+  }
+
+  to_string() {
+    return '<Database ${self._path}${self.is_closed() ? " closed" : ""}>'
+  }
+
+  _open() {
+    if self._handle.is_freed() {
+      raise SqliteError('the database has been closed', c.SQLITE_MISUSE)
+    }
+  }
+
+  # Holds on to the callbacks SQLite now has under `key`, releasing the
+  # ones they replace; SQLite let go of those when it took the new ones.
+  _keep(key: string, calls: list, rc: number) {
+    if rc != c.SQLITE_OK {
+      for call in calls {
+        call.release()
+      }
+
+      check(self._handle, rc)
+    }
+
+    for call in self._callbacks.get(key, []) {
+      call.release()
+    }
+
+    self._callbacks[key] = calls
+  }
+}

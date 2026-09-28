@@ -1,0 +1,185 @@
+# Tests for the notebook.
+
+import test { * }
+import os
+
+import ..app.notes { Notebook, NotebookError, natural_compare, word_count }
+
+describe('natural_compare', @{
+  it('orders numbers inside text by value', @{
+    expect(natural_compare('note 2', 'note 10')).to_be_negative()
+    expect(natural_compare('note 10', 'note 2')).to_be_positive()
+    expect(natural_compare('v1.9', 'v1.10')).to_be_negative()
+  })
+
+  it('ignores case', @{
+    expect(natural_compare('Apple', 'apple')).to_be_zero()
+    expect(natural_compare('apple', 'Banana')).to_be_negative()
+  })
+
+  it('puts a prefix first', @{
+    expect(natural_compare('note', 'note 1')).to_be_negative()
+  })
+})
+
+describe('word_count', @{
+  it('counts runs between any whitespace', @{
+    expect(word_count('one  two\tthree\nfour')).to_be(4)
+    expect(word_count('')).to_be(0)
+    expect(word_count(nil)).to_be(0)
+  })
+})
+
+describe('Notebook', @{
+  var book = nil
+
+  before_each(@{
+    book = Notebook(':memory:')
+  })
+
+  after_each(@{
+    book.close()
+  })
+
+  it('adds a note and reads it back with its tags', @{
+    var id = book.add('Groceries', 'milk and eggs', ['home', 'errands'])
+    var note = book.get(id)
+
+    expect(note.title).to_be('Groceries')
+    expect(note.body).to_be('milk and eggs')
+    expect(note.tags).to_equal(['errands', 'home'])
+    expect(note.attachments).to_be_empty()
+  })
+
+  it('has nothing for an id it never issued', @{
+    expect(book.get(99)).to_be_nil()
+    expect(@{
+      book.remove(99)
+    }).to_raise_instance_of(NotebookError)
+    expect(@{
+      book.update(99, { title: 'x' })
+    }).to_raise_instance_of(NotebookError)
+  })
+
+  it('lists notes in natural order, filtered by tag', @{
+    book.add('Note 10', 'x', ['a'])
+    book.add('Note 2', 'y', ['a', 'b'])
+    book.add('Other', 'z')
+
+    var titles = book.list().map(@(note) => note.title)
+    expect(titles).to_equal(['Note 2', 'Note 10', 'Other'])
+    expect(book.list('b').map(@(note) => note.title)).to_equal(['Note 2'])
+    expect(book.list()[0].tags).to_be('a, b')
+  })
+
+  it('matches tags without regard to case', @{
+    var id = book.add('Trip', 'boots', ['Travel'])
+    book.tag(id, ['travel', 'maps'])
+
+    expect(book.get(id).tags).to_equal(['maps', 'Travel'])
+    expect(book.list('TRAVEL')).to_have_length(1)
+
+    book.untag(id, ['TRAVEL'])
+    expect(book.get(id).tags).to_equal(['maps'])
+  })
+
+  it('updates a title or a body and keeps the search index in step', @{
+    var id = book.add('Draft', 'first words')
+    book.update(id, { body: 'second thoughts' })
+
+    expect(book.get(id).title).to_be('Draft')
+    expect(book.search('first')).to_be_empty()
+    expect(book.search('thoughts')[0].id).to_be(id)
+  })
+
+  it('removes a note with its tags and attachments', @{
+    var id = book.add('Gone', 'soon', ['temp'])
+    book.attach(id, 'a.bin', bytes([1, 2]))
+    book.remove(id)
+
+    expect(book.list()).to_be_empty()
+    expect(book.search('soon')).to_be_empty()
+    expect(book.database().value('select count(*) from tags')).to_be(0)
+    expect(book.database().value('select count(*) from attachments')).to_be(0)
+  })
+
+  it('searches by relevance, matching other forms of a word', @{
+    book.add('Running plan', 'run three times a week')
+    book.add('Cooking', 'the eggs run when warm; eggs, eggs, eggs')
+    book.add('Unrelated', 'nothing here')
+
+    var hits = book.search('eggs')
+    expect(hits).to_have_length(1)
+    expect(hits[0].excerpt).to_contain('[eggs]')
+
+    var found = book.search('running').map(@(hit) => hit.title)
+    expect(found).to_contain_all(['Running plan', 'Cooking'])
+    var titled = book.search('title:running').map(@(hit) => hit.title)
+    expect(titled).to_equal(['Running plan'])
+  })
+
+  it('reports a malformed search', @{
+    expect(@{
+      book.search('eggs AND')
+    }).to_raise()
+  })
+
+  it('stores and reads back a large attachment through a blob handle', @{
+    var id = book.add('Files', '')
+    var data = bytes(0)
+    iter var i = 0; i < 150000; i++ {
+      data.append((i * 7) % 256)
+    }
+
+    book.attach(id, 'big.bin', data)
+    expect(book.attachment(id, 'big.bin')).to_equal(data)
+
+    book.attach(id, 'big.bin', bytes([5]))
+    expect(book.attachment(id, 'big.bin')).to_equal(bytes([5]))
+    expect(book.get(id).attachments).to_equal([{ name: 'big.bin', size: 1 }])
+  })
+
+  it('refuses an attachment that is not there', @{
+    var id = book.add('Files', '')
+
+    expect(@{
+      book.attachment(id, 'missing')
+    }).to_raise_instance_of(NotebookError)
+    expect(@{
+      book.attach(99, 'x', bytes([1]))
+    }).to_raise_instance_of(NotebookError)
+  })
+
+  it('totals words and tags inside SQL', @{
+    book.add('Short', 'one two', ['a'])
+    book.add('Long', 'one two three four five', ['a', 'b'])
+
+    var stats = book.stats()
+
+    expect(stats.notes).to_be(2)
+    expect(stats.words).to_be(7)
+    expect(stats.wordiest).to_be('Long')
+    expect(stats.tags).to_equal([
+      { tag: 'a', notes: 2 }, { tag: 'b', notes: 1 },
+    ])
+  })
+
+  it('totals an empty notebook', @{
+    expect(book.stats()).to_match_object({
+      notes: 0, words: 0, wordiest: nil, tags: [],
+    })
+  })
+
+  it('backs up to a file that opens as a notebook', @{
+    book.add('Kept', 'safe', ['backup'])
+
+    var folder = os.create_temp_dir('notes-test-')
+    var path = os.join_paths(folder, 'copy.db')
+    expect(book.backup(path)).to_be_greater_than(0)
+
+    var copy = Notebook(path)
+    expect(copy.list().map(@(note) => note.title)).to_equal(['Kept'])
+    copy.close()
+    os.remove_dir(folder, true)
+  })
+})

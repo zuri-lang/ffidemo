@@ -1,0 +1,35 @@
+/**
+ * @module sqlite
+ *
+ * SQLite through its C API, reached with `ffi` and nothing else: the
+ * header as SQLite ships it, the library the system has installed, and
+ * Zuri on top.
+ *
+ * ```zuri,ignore
+ * import .sqlite
+ *
+ * var db = sqlite.open(':memory:')
+ * db.execute('create table people (name text, born integer)')
+ * db.execute('insert into people values (?, ?)', ['Ada', 1815])
+ *
+ * echo db.select('select * from people')
+ * db.close()
+ * ```
+ */
+
+import @.native { version, has_option }
+import @.errors { SqliteError }
+import @.statement { Statement }
+import @.blob { Blob }
+import @.database { Database }
+
+/**
+ * Opens a database. `options` are as for the `Database` constructor.
+ *
+ * @param string path A file, or `':memory:'`.
+ * @param dict|nil options
+ * @returns Database
+ */
+def open(path: string, options) {
+  return Database(path, options)
+}

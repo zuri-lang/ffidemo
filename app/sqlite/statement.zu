@@ -1,0 +1,316 @@
+/**
+ * @module statement
+ *
+ * A compiled SQL statement, run as many times as it is needed with
+ * different parameters.
+ *
+ * ```zuri,ignore
+ * var insert = db.prepare('insert into people (name, born) values (?, ?)')
+ * insert.run(['Ada', 1815])
+ * insert.run(['Grace', 1906])
+ * insert.close()
+ * ```
+ *
+ * A statement belongs to the connection that compiled it. It is
+ * finalized when closed, or when the collector finds it unreachable,
+ * whichever comes first.
+ */
+
+import .native { c, threaded_step }
+import .errors { SqliteError, check, failure }
+import .values
+
+/**
+ * A prepared statement.
+ */
+class Statement {
+  var _handle
+  var _db
+  var _threaded = false
+  var _columns
+
+  /**
+   * Statements come from `Database.prepare()`.
+   *
+   * @param Pointer handle The `sqlite3_stmt *`, owned by this statement.
+   * @param Pointer db The connection it was compiled on.
+   * @param bool threaded Whether steps run on a helper thread.
+   * @constructor
+   */
+  @new(handle, db, threaded) {
+    self._handle = handle
+    self._db = db
+    self._threaded = threaded
+  }
+
+  /**
+   * The SQL the statement was compiled from.
+   *
+   * @returns string
+   */
+  sql() {
+    self._open()
+
+    return c.sqlite3_sql(self._handle)
+  }
+
+  /**
+   * The SQL with the values currently bound written into it, as SQLite
+   * would log it.
+   *
+   * @returns string
+   */
+  expanded_sql() {
+    self._open()
+
+    # SQLite hands over this text for the caller to release with
+    # sqlite3_free(), which owning the pointer arranges.
+    var text = c.sqlite3_expanded_sql(self._handle).own(c.sqlite3_free)
+    var sql = text.read_string()
+    text.free()
+
+    return sql
+  }
+
+  /**
+   * How many parameters the statement takes.
+   *
+   * @returns number
+   */
+  parameter_count() {
+    self._open()
+
+    return c.sqlite3_bind_parameter_count(self._handle)
+  }
+
+  /**
+   * The names of the columns a row of the result has, in order.
+   *
+   * @returns list
+   */
+  columns() {
+    self._open()
+
+    if self._columns == nil {
+      var names = []
+      var count = c.sqlite3_column_count(self._handle)
+
+      iter var i = 0; i < count; i++ {
+        names.append(c.sqlite3_column_name(self._handle, i))
+      }
+
+      self._columns = names
+    }
+
+    return self._columns
+  }
+
+  /**
+   * Sets the parameters for the next run, clearing the ones set before.
+   *
+   * A list fills the parameters in order. A dictionary fills them by
+   * name, with or without the `:`, `@` or `$` the SQL spells them with.
+   *
+   * @param list|dict|nil params
+   * @returns self
+   * @throws SqliteError when a value is refused or a name is unknown.
+   * @throws TypeError when a value has no SQLite counterpart.
+   */
+  bind(params) {
+    self._open()
+
+    c.sqlite3_reset(self._handle)
+    c.sqlite3_clear_bindings(self._handle)
+
+    if params == nil {
+      return self
+    }
+
+    if is_list(params) {
+      for i, value in params {
+        check(self._db, values.bind(self._handle, i + 1, value))
+      }
+
+      return self
+    }
+
+    for name, value in params {
+      var index = self._index_of(name)
+      check(self._db, values.bind(self._handle, index, value))
+    }
+
+    return self
+  }
+
+  /**
+   * Runs the statement to its next row.
+   *
+   * @returns bool `true` when a row is ready to read, `false` once the
+   *    statement has finished.
+   * @throws SqliteError when the statement fails.
+   */
+  step() {
+    self._open()
+
+    var rc = self._threaded ?
+      threaded_step(self._handle) :
+      c.sqlite3_step(self._handle)
+
+    if rc == c.SQLITE_ROW {
+      return true
+    }
+
+    if rc == c.SQLITE_DONE {
+      return false
+    }
+
+    # The statement is reset so it can run again, and the error is read
+    # from the connection first, since resetting does not keep it.
+    var error = failure(self._db, rc)
+    c.sqlite3_reset(self._handle)
+    raise error
+  }
+
+  /**
+   * The row the statement is on, as a dictionary keyed by column name.
+   *
+   * @returns dict
+   */
+  row() {
+    var row = {}
+
+    for i, name in self.columns() {
+      row[name] = values.column(self._handle, i)
+    }
+
+    return row
+  }
+
+  /**
+   * The row the statement is on, as a list in column order.
+   *
+   * @returns list
+   */
+  values() {
+    var out = []
+    var count = self.columns().length()
+
+    iter var i = 0; i < count; i++ {
+      out.append(values.column(self._handle, i))
+    }
+
+    return out
+  }
+
+  /**
+   * Runs the statement with `params` and collects every row.
+   *
+   * @param list|dict|nil params
+   * @returns list Dictionaries, one per row.
+   */
+  all(params) {
+    self.bind(params)
+
+    var rows = []
+    while self.step() {
+      rows.append(self.row())
+    }
+
+    c.sqlite3_reset(self._handle)
+
+    return rows
+  }
+
+  /**
+   * Runs the statement with `params`, calling `visit` with each row as it
+   * is produced. `visit` returning `false` stops early.
+   *
+   * @param list|dict|nil params
+   * @param function visit
+   * @returns number How many rows were visited.
+   */
+  each(params, visit: function) {
+    self.bind(params)
+
+    var visited = 0
+    while self.step() {
+      visited++
+      if visit(self.row()) == false {
+        break
+      }
+    }
+
+    c.sqlite3_reset(self._handle)
+
+    return visited
+  }
+
+  /**
+   * Runs the statement with `params` for its effect.
+   *
+   * @param list|dict|nil params
+   * @returns dict `{ rows_affected, last_insert_id }`
+   */
+  run(params) {
+    self.bind(params)
+
+    while self.step() {
+      # A RETURNING clause produces rows even from a statement run for
+      # its effect, and stepping past them is what finishes it.
+    }
+
+    c.sqlite3_reset(self._handle)
+
+    return {
+      rows_affected: c.sqlite3_changes(self._db),
+      last_insert_id: c.sqlite3_last_insert_rowid(self._db),
+    }
+  }
+
+  /**
+   * Finalizes the statement. Safe to call more than once.
+   */
+  close() {
+    if !self._handle.is_freed() {
+      self._handle.free()
+    }
+  }
+
+  /**
+   * Whether `close()` has been called.
+   *
+   * @returns bool
+   */
+  is_closed() {
+    return self._handle.is_freed()
+  }
+
+  to_string() {
+    if self.is_closed() {
+      return '<Statement closed>'
+    }
+
+    return '<Statement ${self.sql()}>'
+  }
+
+  _open() {
+    if self._handle.is_freed() {
+      raise SqliteError('the statement has been closed', c.SQLITE_MISUSE)
+    }
+  }
+
+  # The parameter a dictionary key names, trying the prefixes SQL spells
+  # parameter names with.
+  _index_of(name: string) {
+    for prefix in ['', ':', '@', '$'] {
+      var index = c.sqlite3_bind_parameter_index(self._handle, prefix + name)
+      if index > 0 {
+        return index
+      }
+    }
+
+    raise SqliteError(
+      "the statement has no parameter named '${name}'", c.SQLITE_RANGE,
+    )
+  }
+}

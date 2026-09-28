@@ -1,0 +1,362 @@
+/**
+ * @module app
+ *
+ * `notes`, a notebook on the command line, kept in SQLite through the
+ * `sqlite` package this project builds on `ffi`.
+ *
+ * ```sh
+ * zuri run . add 'Groceries' --body 'milk, eggs' --tag home
+ * zuri run . search eggs
+ * zuri run . stats
+ * zuri run            # a tour of everything, in a throwaway notebook
+ * ```
+ *
+ * The notebook is `notes.db` in the working directory unless `--db` or
+ * the `NOTES_DB` environment variable names another.
+ */
+
+import args
+import io
+import os
+
+import @.notes { Notebook, NotebookError, natural_compare, word_count }
+import @.sqlite
+
+/**
+ * The command-line parser, built fresh so each use gets a clean one.
+ *
+ * @returns args.Parser
+ */
+def parser() {
+  var parser = args.Parser('notes', false)
+  parser.description = 'A notebook kept in SQLite, reached through ffi.'
+
+  parser.add_option('db', 'The notebook file', {
+    short_name: 'd',
+    type: args.STRING,
+    value: os.get_env('NOTES_DB') or 'notes.db',
+  })
+
+  var add = parser.add_command(
+    'add', 'Write a note', _value(args.STRING, 'title'),
+  )
+  add.add_option('body', 'What the note says', _text('b'))
+  add.add_option('tag', 'A tag, as many as wanted', _tags())
+
+  var list = parser.add_command('list', 'List notes by title')
+  list.add_option('tag', 'Only notes with this tag', _text('t'))
+
+  parser.add_command('show', 'Show one note', _value(args.INT, 'id'))
+
+  var edit = parser.add_command('edit', 'Change a note', _value(args.INT, 'id'))
+  edit.add_option('title', 'The new title', { type: args.STRING })
+  edit.add_option('body', 'The new body', _text('b'))
+
+  parser.add_command('remove', 'Delete a note', _value(args.INT, 'id'))
+
+  var tag = parser.add_command('tag', 'Tag a note', _value(args.INT, 'id'))
+  tag.add_option('tag', 'A tag, as many as wanted', _tags())
+
+  var untag = parser.add_command('untag', 'Remove tags', _value(args.INT, 'id'))
+  untag.add_option('tag', 'A tag, as many as wanted', _tags())
+
+  var search = parser.add_command(
+    'search', 'Search the notes', _value(args.STRING, 'query'),
+  )
+  search.add_option(
+    'limit', 'At most this many results', { type: args.INT, value: 20 },
+  )
+
+  var attach = parser.add_command(
+    'attach', 'Attach a file', _value(args.INT, 'id'),
+  )
+  attach.add_option('file', 'The file to attach', {
+    short_name: 'f',
+    type: args.STRING,
+    required: true,
+  })
+
+  var save = parser.add_command(
+    'save', 'Save an attachment', _value(args.INT, 'id'),
+  )
+  save.add_option('name', 'The attachment', {
+    short_name: 'n',
+    type: args.STRING,
+    required: true,
+  })
+  save.add_option('output', 'Where to write it', _text('o'))
+
+  parser.add_command('stats', 'Totals for the notebook')
+  parser.add_command('backup', 'Copy the notebook', _value(args.STRING, 'path'))
+  parser.add_command('tour', 'Show everything off in a throwaway notebook')
+
+  return parser
+}
+
+# What a command takes as its own value, and the word help shows for it.
+def _value(type, metavar: string) {
+  return { type, metavar }
+}
+
+# A text option with a short name.
+def _text(short_name: string) {
+  return { short_name, type: args.STRING }
+}
+
+# The repeatable `--tag`.
+def _tags() {
+  return { short_name: 't', type: args.LIST }
+}
+
+/**
+ * Carries out one parsed command line against a notebook.
+ *
+ * @param dict parsed What `parser().parse()` returned.
+ * @returns number The exit status.
+ */
+def run(parsed: dict) {
+  var command = parsed.command
+
+  if command == nil or command.name == 'tour' {
+    tour()
+    return 0
+  }
+
+  var options = parsed.options
+  var book = Notebook(options.db)
+
+  catch {
+    _dispatch(book, command.name, command.value, options)
+  } as error {
+    book.close()
+
+    if instance_of(error, NotebookError)
+      or instance_of(error, sqlite.SqliteError) {
+      report(error.message)
+      return 1
+    }
+
+    raise error
+  }
+
+  book.close()
+
+  return 0
+}
+
+/**
+ * Reports `message` on stderr as an error.
+ *
+ * @param string message
+ */
+def report(message: string) {
+  io.stderr.write('error: ${message}\n')
+}
+
+/**
+ * Walks through what the notebook, and the `ffi` underneath it, can do,
+ * using a notebook that lives only in memory.
+ */
+def tour() {
+  echo 'SQLite ${sqlite.version()}, loaded with ffi from the system library'
+  echo 'full-text search: ${sqlite.has_option("ENABLE_FTS5") ? "yes" : "no"}'
+  echo ''
+
+  var book = Notebook(':memory:')
+
+  var ids = [
+    book.add('Note 10', 'The tenth note, to show natural ordering.', ['meta']),
+    book.add('Note 2', 'The second note. It comes before the tenth.', ['meta']),
+    book.add(
+      'Sourdough',
+      'Feed the starter the night before. Mix flour, water and salt, fold ' +
+        'every half hour, then let it rise slowly in the fridge overnight.',
+      ['baking', 'home']
+    ),
+    book.add('Groceries', 'Milk, eggs, flour and a bag of rye.', ['home']),
+    book.add(
+      'Running plan', 'Run three times a week, a long run on Sundays.',
+      ['health'],
+    ),
+  ]
+
+  echo 'Notes, in natural order (the collation is a Zuri function):'
+  for note in book.list() {
+    echo '  ${note.id}. ${note.title} (${note.words} words) [${note.tags}]'
+  }
+  echo ''
+
+  echo 'Searching for "flour" (FTS5, ranked):'
+  for hit in book.search('flour') {
+    echo '  ${hit.id}. ${hit.title}: ${hit.excerpt}'
+  }
+  echo ''
+
+  echo 'Searching for "runs", which matches "run" and "running":'
+  for hit in book.search('runs') {
+    echo '  ${hit.id}. ${hit.title}'
+  }
+  echo ''
+
+  var stats = book.stats()
+  echo 'Stats (word_count() and wordiest() are Zuri, run inside SQL):'
+  echo '  ${stats.notes} notes, ${stats.words} words; ' +
+    'the wordiest is "${stats.wordiest}"'
+  for row in stats.tags {
+    echo '  ${row.tag}: ${row.notes}'
+  }
+  echo ''
+
+  # A 200 KB attachment, written and read back through a blob handle in
+  # 64 KB windows.
+  var data = bytes(0)
+  iter var i = 0; i < 200000; i++ {
+    data.append(i % 251)
+  }
+  book.attach(ids[2], 'starter.bin', data)
+  var back = book.attachment(ids[2], 'starter.bin')
+  echo 'Attachment: wrote ${data.length()} bytes, ' +
+    'read back ${back.length()}, ' +
+    'identical: ${back == data}'
+  echo ''
+
+  var db = book.database()
+
+  # A transaction that raises rolls back.
+  var before = db.value('select count(*) from notes')
+  catch {
+    db.transaction(@(tx) {
+      tx.execute('delete from notes')
+      raise Error('changed my mind')
+    })
+  } as error {
+    echo 'Transaction: "${error.message}", notes before ${before}, after ' +
+      '${db.value("select count(*) from notes")}'
+  }
+  echo ''
+
+  # A long query stepped on a helper thread; SQLite calls the progress
+  # handler from that thread, and the isolate answers each call.
+  var threaded = sqlite.open(':memory:', { threaded: true })
+  var ticks = 0
+  threaded.on_progress(20000, @() {
+    ticks++
+  })
+  var total = threaded.value(
+    'with recursive n (i) as
+       (select 1 union all select i + 1 from n where i < 200000)
+     select sum(i) from n'
+  )
+  threaded.close()
+  echo 'Threaded query: sum ${total}, ' +
+    '${ticks} progress calls from SQLite\'s thread'
+  echo ''
+
+  # Every statement traced, with its parameters filled in.
+  var traced = []
+  db.on_trace(@(sql, milliseconds) {
+    traced.append(sql)
+  })
+  book.tag(ids[3], ['errands'])
+  db.on_trace(nil)
+  echo 'Traced while tagging:'
+  for sql in traced {
+    echo '  ${sql}'
+  }
+  echo ''
+
+  var folder = os.create_temp_dir('notes-tour-')
+  var copy = os.join_paths(folder, 'backup.db')
+  var pages = book.backup(copy)
+  var restored = Notebook(copy)
+  var kept = restored.list().length()
+  echo 'Backup: ${pages} pages copied, the copy holds ${kept} notes'
+  restored.close()
+  os.remove_dir(folder, true)
+
+  book.close()
+}
+
+/**
+ * Where `zuri run` starts.
+ */
+def main() {
+  var status = run(parser().parse())
+  if status != 0 {
+    os.exit(status)
+  }
+}
+
+# One command against an open notebook.
+def _dispatch(book, name: string, value, options: dict) {
+  using name {
+    when 'add' {
+      var id = book.add(value, options.get('body'), options.get('tag'))
+      echo 'added note ${id}'
+    }
+    when 'list' {
+      for note in book.list(options.get('tag')) {
+        echo '${note.id}. ${note.title} (${note.words} words)' +
+          (note.tags == nil ? '' : ' [${note.tags}]')
+      }
+    }
+    when 'show' _show(book, value)
+    when 'edit' {
+      book.update(
+        value, { title: options.get('title'), body: options.get('body') },
+      )
+      echo 'updated note ${value}'
+    }
+    when 'remove' {
+      book.remove(value)
+      echo 'removed note ${value}'
+    }
+    when 'tag' book.tag(value, options.get('tag') or [])
+    when 'untag' book.untag(value, options.get('tag') or [])
+    when 'search' {
+      for hit in book.search(value, options.limit) {
+        echo '${hit.id}. ${hit.title}: ${hit.excerpt}'
+      }
+    }
+    when 'attach' {
+      var path = options.file
+      book.attach(value, os.base_name(path), file(path, 'rb').read())
+      echo 'attached ${os.base_name(path)} to note ${value}'
+    }
+    when 'save' {
+      var data = book.attachment(value, options.name)
+      file(options.get('output') or options.name, 'wb').write(data)
+      echo 'saved ${data.length()} bytes'
+    }
+    when 'stats' {
+      var stats = book.stats()
+      echo '${stats.notes} notes, ${stats.words} words'
+      if stats.wordiest != nil {
+        echo 'wordiest: ${stats.wordiest}'
+      }
+      for row in stats.tags {
+        echo '${row.tag}: ${row.notes}'
+      }
+    }
+    when 'backup' echo '${book.backup(value)} pages copied to ${value}'
+  }
+}
+
+# Prints one note in full.
+def _show(book, id: number) {
+  var note = book.get(id)
+  if note == nil {
+    raise NotebookError('there is no note ${id}')
+  }
+
+  echo '${note.id}. ${note.title}'
+  echo 'created ${note.created}, updated ${note.updated}'
+  if !note.tags.is_empty() {
+    echo 'tags: ${", ".join(note.tags)}'
+  }
+  echo ''
+  echo note.body
+  for attachment in note.attachments {
+    echo '[attachment] ${attachment.name}, ${attachment.size} bytes'
+  }
+}
